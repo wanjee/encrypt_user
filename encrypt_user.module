@@ -1,0 +1,302 @@
+<?php
+
+// TODO add query alter
+
+// TODO Optimize: do not encrypt/decrypt a value twice if it was already encrypted/decrypted during a single process
+
+// TODO Implement views filters
+
+// TODO anything else ?
+
+
+
+/**
+ * @file
+ * Provide encryption for username data.
+ */
+
+/**
+ * Implements hook_boot().
+ *
+ * Make the email address available for the connected user (loaded during the
+ * bootstrap).
+ */
+function encrypt_user_init() {
+  global $user;
+  if ($user) {
+    // uncrypt datas for the connected user.
+    encrypt_user_user_load(array($user));
+  }
+}
+
+/**
+ * Implements hook_module_implements_alter().
+ *
+ * Change the hook order. The purpose is to improve the compatibility with
+ * custom modules : call the encrypt_user module on an early stage for decrypting and
+ * on a ultimate stage for encrypting.
+ */
+function encrypt_user_module_implements_alter(&$implementations, $hook) {
+  // FIXME Improve this, this is currently mostly borrowed from DBEE module but should be perfected
+  // In order to improve compatibility with custom modules, set the decryption
+  // on an early stage.
+  $hook_decrypt = array(
+    'user_load',
+    'user_insert',
+    'user_update',
+    'mail_alter',
+    'boot',
+    'entity_load',
+  );
+  if (in_array($hook, $hook_decrypt) && isset($implementations['encrypt_user'])) {
+    $group = $implementations['encrypt_user'];
+    unset($implementations['encrypt_user']);
+    $implementations = array_merge(array('encrypt_user' => $group), $implementations);
+  }
+
+  // In order to improve compatibility with custom modules, set the encryption
+  // on an ultimate stage.
+  $hook_encrypt = array(
+    'query_alter',
+    'query_user_load_multiple_alter',
+    'query_pager_alter',
+    'entity_query_alter',
+    'user_presave',
+  );
+  if (in_array($hook, $hook_encrypt) && isset($implementations['encrypt_user'])) {
+    $group = $implementations['encrypt_user'];
+    unset($implementations['encrypt_user']);
+    $implementations['encrypt_user'] = $group;
+  }
+}
+
+/**
+ * Implements hook_user_presave().
+ *
+ * Save the encrypted data in the data column of the users table.
+ */
+function encrypt_user_user_presave(&$edit, $account, $category) {
+
+  $encrypted_fields = encrypt_user_get_field_names();
+
+  foreach ($encrypted_fields as $field_name) {
+    // If the value wasn't submitted, get it from the
+    // existing account, if there is one.
+    if (!isset($edit[$field_name])) {
+      if (isset($account->{$field_name})) {
+        $edit[$field_name] = $account->{$field_name};
+      }
+      else {
+        $edit[$field_name] = '';
+      }
+    }
+
+    // Encrypt the field and replace it with a hash of the encrypted data.
+    if (!empty($edit[$field_name])) {
+      $encrypted_field_name = 'encrypt_' . $field_name;
+      $edit['data'][$encrypted_field_name] = encrypt_user_encrypt_data($edit[$field_name]);
+      $edit[$field_name] = drupal_hash_base64($edit['data'][$encrypted_field_name]);
+    }
+  }
+}
+
+/**
+ * Implements hook_user_load().
+ */
+function encrypt_user_user_load($users) {
+  $encrypted_fields = encrypt_user_get_field_names();
+
+  foreach ($users as &$account) {
+    foreach ($encrypted_fields as $field_name) {
+      // decrypt $field_name
+      $account->{$field_name} = encrypt_user_get_decrypted_user_field($account, $field_name);
+    }
+  }
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter().
+ */
+function encrypt_user_form_user_admin_account_alter(&$form, &$form_state, $form_id) {
+
+  if (empty($form['accounts']['#options'])) {
+    return;
+  }
+
+  foreach ($form['accounts']['#options'] as $uid => $user_data) {
+    $account = user_load($uid);
+    $form['accounts']['#options'][$uid]['username'] = encrypt_user_get_decrypted_user_field($account, 'name');
+  }
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter().
+ */
+function encrypt_user_form_user_login_alter(&$form, &$form_state, $form_id) {
+  array_unshift($form["#validate"], 'encrypt_user_form_user_login_validate');
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter().
+ */
+function encrypt_user_form_user_login_block_alter(&$form, &$form_state, $form_id) {
+  array_unshift($form["#validate"], 'encrypt_user_form_user_login_validate');
+}
+
+/**
+ * Validates user login form: compare hashed values instead of real one
+ *
+ * @param $form
+ * @param $form_state
+ */
+function encrypt_user_form_user_login_validate($form, &$form_state) {
+  if (!empty($form_state['values']['name'])) {
+    $encrypted_name = encrypt_user_encrypt_data($form_state['values']['name']);
+    $form_state['values']['name'] = drupal_hash_base64($encrypted_name);
+  }
+}
+
+/**
+ * Implements hook_views_api().
+ *
+ * Make the email address available for the Views module.
+ */
+function encrypt_user_views_api() {
+  return array(
+    'api' => 3,
+    'path' => drupal_get_path('module', 'encrypt_user') . '/views',
+  );
+}
+
+/**
+ * Encrypt a single user piece of data.
+ */
+function encrypt_user_encrypt_data($text) {
+  return encrypt($text, NULL, NULL, NULL, 'default');
+}
+
+/**
+ * Decrypt a single user piece of data.
+ */
+function encrypt_user_decrypt_data($encrypted) {
+  return decrypt($encrypted);
+}
+
+/**
+ * Get the decrypted value of a user field.
+ */
+function encrypt_user_get_decrypted_user_field($account, $field_name) {
+  $encrypted_field_name = 'encrypt_' . $field_name;
+
+  // User is anonymous
+  if ($account->uid == 0) {
+    return NULL;
+  }
+
+  if (empty($account->data[$encrypted_field_name])) {
+    if (isset($account->{$field_name})) {
+      return $account->{$field_name};
+    }
+    else {
+      return NULL;
+    }
+  }
+
+  return encrypt_user_decrypt_data($account->data[$encrypted_field_name]);
+}
+
+/**
+ * Helper to get the field name this module is responsible for.
+ */
+function encrypt_user_get_field_names() {
+  // FIXME allow this to be a configuration (i.e. using a dedicated hook)
+  return array(
+    'name',
+    'mail',
+    'init',
+  );
+}
+
+/**
+ * Encrypts or decrypts all user email fields.
+ *
+ * This function encrypts or decrypts all user email addresses from the user
+ * table. It is used when the module is installed, enabled or disabled.
+ *
+ * @param $action
+ *   A string. Possible values are 'decrypt' and 'encrypt' .
+ *
+ * @param $set_message
+ *   A boolean (optional). If true : it displays a message when the
+ *   encryption/decryption is completed. Defaults to TRUE.
+ */
+function encrypt_user_update_crypt_all($action) {
+  // FIXME use batch API to allow this when a lot of users exist.
+
+  if (!in_array($action, array('decrypt', 'encrypt'))) {
+    return FALSE;
+  }
+
+  $encrypted_fields = encrypt_user_get_field_names();
+
+  if (empty($encrypted_fields)) {
+    drupal_set_message(t('Encryption operation (%action) was attempted but no fields are configured to be encrypted.', array('%action' => $action)));
+    watchdog('encrypt_user', 'Encryption operation (%action) was attempted but no fields are configured to be encrypted.', array('%action' => $action), WATCHDOG_NOTICE);
+    return FALSE;
+  }
+
+  $query = db_select('users', 'u')
+    ->fields('u', array_merge(array('uid', 'data'), $encrypted_fields))
+    ->condition('uid', 0, '<>');
+
+  $result = $query->execute();
+  $updated_users = $n_users = 0;
+
+  while ($account = $result->fetchObject()) {
+    $account->data = unserialize($account->data);
+
+    $current = $update = array();
+    $current['data'] = $account->data;
+
+    // Manage encryption or decryption of supported fields
+    foreach ($encrypted_fields as $field_name) {
+      $encrypted_field_name = 'encrypt_' . $field_name;
+      // store current value to avoid useless queries later in the process
+      $current[$field_name] = $account->{$field_name};
+
+      if ($action == 'decrypt') {
+        $account->{$field_name} = encrypt_user_get_decrypted_user_field($account, $field_name);
+        unset($account->data[$encrypted_field_name]);
+      }
+      else { // Case $action == 'encrypt':
+        $account->data[$encrypted_field_name] = encrypt_user_encrypt_data($account->{$field_name});
+        $account->{$field_name} = drupal_hash_base64($account->data[$encrypted_field_name]);
+      }
+
+      $update[$field_name] = $account->{$field_name};
+    }
+
+    $update['data'] = serialize($account->data);
+
+    $compare = array_diff_assoc($current, $update);
+    if (!empty($compare)) {
+      // Update of the users table with new field values.
+      $updated_users++;
+      db_update('users')
+        ->fields($update)
+        ->condition('uid', $account->uid)
+        ->execute();
+    }
+
+    $n_users++;
+  }
+
+  // Display message.
+  drupal_set_message(t('User fields have been %crypted (concerning @updated_users of @total_users users)',
+    array('@updated_users' => $updated_users, '@total_users' => $n_users, '%crypted' => (($action == 'encrypt') ? t('encrypted') : t('decrypted')))));
+
+  // Watchdog changes.
+  watchdog('encrypt_user', 'User fields have been %crypted (concerning @updated_users of @total_users users)',
+    array('%crypted' => (($action == 'encrypt') ? t('encrypted') : t('decrypted')), '@updated_users' => $updated_users, '@total_users' => $n_users), WATCHDOG_NOTICE);
+}
+

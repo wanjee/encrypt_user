@@ -1,0 +1,8 @@
+name = Encrypt user
+core = 7.x
+description = Encrypt the name, mail and init columns in core users table.
+dependencies[] = encrypt
+package = Encryption
+
+files[] = views/views_handler_field_encrypt_user_user_name.inc
+files[] = views/views_handler_field_encrypt_user_user_mail.inc

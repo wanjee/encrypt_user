@@ -1,0 +1,16 @@
+<?php
+
+/**
+ * Implements hook_install().
+ */
+function encrypt_user_enable() {
+  encrypt_user_update_crypt_all('encrypt');
+}
+
+/**
+ * Implements hook_uninstall().
+ */
+function encrypt_user_disable() {
+  encrypt_user_update_crypt_all('decrypt');
+}
+
