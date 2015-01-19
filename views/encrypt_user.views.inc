@@ -10,6 +10,10 @@
 function encrypt_user_views_data_alter(&$data) {
   foreach ($data as $table => $config) {
     foreach ($config as $item => $item_config) {
+      if (isset($item_config['filter']['handler']) && $item_config['filter']['handler'] == 'views_handler_filter_user_name') {
+        $data[$table][$item]['filter']['handler'] = 'views_handler_filter_encrypt_user_name';
+      }
+
       if (isset($item_config['field']['handler']) && $item_config['field']['handler'] == 'views_handler_field_user_name') {
         $data[$table][$item]['field']['handler'] = 'views_handler_field_encrypt_user_user_name';
       }

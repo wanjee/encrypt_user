@@ -1,19 +1,15 @@
 <?php
 
-// TODO add query alter
+/**
+ * @file
+ * Provide encryption for user data (name, mail, init).
+ */
 
 // TODO Optimize: do not encrypt/decrypt a value twice if it was already encrypted/decrypted during a single process
 
-// TODO Implement views filters
+// TODO Implement views exposed filters (may be done via query alter)
 
 // TODO anything else ?
-
-
-
-/**
- * @file
- * Provide encryption for username data.
- */
 
 /**
  * Implements hook_boot().
@@ -24,7 +20,7 @@
 function encrypt_user_init() {
   global $user;
   if ($user) {
-    // uncrypt datas for the connected user.
+    // decrypt datas for the connected user.
     encrypt_user_user_load(array($user));
   }
 }
@@ -57,6 +53,7 @@ function encrypt_user_module_implements_alter(&$implementations, $hook) {
   // In order to improve compatibility with custom modules, set the encryption
   // on an ultimate stage.
   $hook_encrypt = array(
+    'node_load', // need to overwrite other hooks data
     'query_alter',
     'query_user_load_multiple_alter',
     'query_pager_alter',
@@ -95,7 +92,7 @@ function encrypt_user_user_presave(&$edit, $account, $category) {
     if (!empty($edit[$field_name])) {
       $encrypted_field_name = 'encrypt_' . $field_name;
       $edit['data'][$encrypted_field_name] = encrypt_user_encrypt_data($edit[$field_name]);
-      $edit[$field_name] = drupal_hash_base64($edit['data'][$encrypted_field_name]);
+      $edit[$field_name] = encrypt_user_get_hash($edit['data'][$encrypted_field_name], FALSE);
     }
   }
 }
@@ -110,6 +107,128 @@ function encrypt_user_user_load($users) {
     foreach ($encrypted_fields as $field_name) {
       // decrypt $field_name
       $account->{$field_name} = encrypt_user_get_decrypted_user_field($account, $field_name);
+    }
+  }
+}
+
+/**
+ * Implements hook_node_load().
+ *
+ * @param $nodes
+ * @param $types
+ */
+function encrypt_user_node_load($nodes, $types) {
+  // Decrypt author name if required
+  $encrypted_fields = encrypt_user_get_field_names();
+
+  if (!in_array('name', $encrypted_fields)) {
+    return;
+  }
+
+  // we need user_node_load() to be already executed to avoid unnecessary load and overwritten values
+  // this is ensured via encrypt_user_module_implements_alter()
+  foreach ($nodes as $nid => $node) {
+    if (!isset($node->uid) || $node->uid == 0 || empty($node->data)) {
+      // ignore if user is anonymous or not set or data is empty or not existing
+      continue;
+    }
+
+    if (is_string($node->data)) {
+      $data = unserialize($node->data);
+    }
+    else {
+      $data = $node->data;
+    }
+
+    if (isset($data['encrypt_name'])) {
+      $nodes[$nid]->name = encrypt_user_decrypt_data($data['encrypt_name']);
+    }
+  }
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter().
+ *
+ * Alter user_profile_form (user edit form)
+ * Replace the email/username validation call backs.
+ */
+function encrypt_user_form_user_profile_form_alter(&$form, &$form_state, $form_id) {
+  $to_replace = 'user_account_form_validate';
+  $replaced_by = 'encrypt_user_user_account_form_validate';
+  $key_to_replace = array_search($to_replace, $form['#validate']);
+  if ($key_to_replace !== FALSE) {
+    $form['#validate'][$key_to_replace] = $replaced_by;
+  }
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter().
+ *
+ * Alter user_register_form (user create form)
+ * Replace the email/username validation call backs.
+ */
+function encrypt_user_form_user_register_form_alter(&$form, &$form_state, $form_id) {
+  encrypt_user_form_user_profile_form_alter($form, $form_state, $form_id);
+}
+
+/**
+ * Form validation handler for user_account_form().
+ *
+ * This function replace the user_account_form_validate() core function.
+ * It is a slightly modified copy of the core function.
+ *
+ * @see user_account_form()
+ */
+function encrypt_user_user_account_form_validate($form, &$form_state) {
+  if ($form['#user_category'] == 'account' || $form['#user_category'] == 'register') {
+    $account = $form['#user'];
+    // Validate new or changing username.
+    if (isset($form_state['values']['name'])) {
+      if ($error = user_validate_name($form_state['values']['name'])) {
+        form_set_error('name', $error);
+      }
+      // encrypt_user fix: fetch name by hash
+      elseif ((bool) db_select('users')->fields('users', array('uid'))->condition('uid', $account->uid, '<>')->condition('name', encrypt_user_get_hash($form_state['values']['name'], TRUE), 'LIKE')->range(0, 1)->execute()->fetchField()) {
+      // Core condition :
+      //elseif ((bool) db_select('users')->fields('users', array('uid'))->condition('uid', $account->uid, '<>')->condition('name', db_like($form_state['values']['name']), 'LIKE')->range(0, 1)->execute()->fetchField()) {
+        form_set_error('name', t('The name %name is already taken.', array('%name' => $form_state['values']['name'])));
+      }
+    }
+
+    // Trim whitespace from mail, to prevent confusing 'e-mail not valid'
+    // warnings often caused by cutting and pasting.
+    $mail = trim($form_state['values']['mail']);
+    form_set_value($form['account']['mail'], $mail, $form_state);
+
+    // Validate the e-mail address, and check if it is taken by an existing user.
+    if ($error = user_validate_mail($form_state['values']['mail'])) {
+      form_set_error('mail', $error);
+    }
+    // encrypt_user fix: fetch mail by hash
+    elseif ((bool) db_select('users')->fields('users', array('uid'))->condition('uid', $account->uid, '<>')->condition('mail', encrypt_user_get_hash($form_state['values']['mail'], TRUE), '=')->range(0, 1)->execute()->fetchField()) {
+    // Core condition :
+    //elseif ((bool) db_select('users')->fields('users', array('uid'))->condition('uid', $account->uid, '<>')->condition('mail', db_like($form_state['values']['mail']), 'LIKE')->range(0, 1)->execute()->fetchField()) {
+      // Format error message dependent on whether the user is logged in or not.
+      if ($GLOBALS['user']->uid) {
+        form_set_error('mail', t('The e-mail address %email is already taken.', array('%email' => $form_state['values']['mail'])));
+      }
+      else {
+        form_set_error('mail', t('The e-mail address %email is already registered. <a href="@password">Have you forgotten your password?</a>', array('%email' => $form_state['values']['mail'], '@password' => url('user/password'))));
+      }
+    }
+
+    // Make sure the signature isn't longer than the size of the database field.
+    // Signatures are disabled by default, so make sure it exists first.
+    if (isset($form_state['values']['signature'])) {
+      // Move text format for user signature into 'signature_format'.
+      $form_state['values']['signature_format'] = $form_state['values']['signature']['format'];
+      // Move text value for user signature into 'signature'.
+      $form_state['values']['signature'] = $form_state['values']['signature']['value'];
+
+      $user_schema = drupal_get_schema('users');
+      if (drupal_strlen($form_state['values']['signature']) > $user_schema['fields']['signature']['length']) {
+        form_set_error('signature', t('The signature is too long: it must be %max characters or less.', array('%max' => $user_schema['fields']['signature']['length'])));
+      }
     }
   }
 }
@@ -130,33 +249,6 @@ function encrypt_user_form_user_admin_account_alter(&$form, &$form_state, $form_
 }
 
 /**
- * Implements hook_form_FORM_ID_alter().
- */
-function encrypt_user_form_user_login_alter(&$form, &$form_state, $form_id) {
-  array_unshift($form["#validate"], 'encrypt_user_form_user_login_validate');
-}
-
-/**
- * Implements hook_form_FORM_ID_alter().
- */
-function encrypt_user_form_user_login_block_alter(&$form, &$form_state, $form_id) {
-  array_unshift($form["#validate"], 'encrypt_user_form_user_login_validate');
-}
-
-/**
- * Validates user login form: compare hashed values instead of real one
- *
- * @param $form
- * @param $form_state
- */
-function encrypt_user_form_user_login_validate($form, &$form_state) {
-  if (!empty($form_state['values']['name'])) {
-    $encrypted_name = encrypt_user_encrypt_data($form_state['values']['name']);
-    $form_state['values']['name'] = drupal_hash_base64($encrypted_name);
-  }
-}
-
-/**
  * Implements hook_views_api().
  *
  * Make the email address available for the Views module.
@@ -172,7 +264,7 @@ function encrypt_user_views_api() {
  * Encrypt a single user piece of data.
  */
 function encrypt_user_encrypt_data($text) {
-  return encrypt($text, NULL, NULL, NULL, 'default');
+  return encrypt($text);
 }
 
 /**
@@ -180,6 +272,17 @@ function encrypt_user_encrypt_data($text) {
  */
 function encrypt_user_decrypt_data($encrypted) {
   return decrypt($encrypted);
+}
+
+/**
+ * Get hash of an encrypted value.
+ */
+function encrypt_user_get_hash($value, $encrypt = TRUE) {
+  if ($encrypt) {
+    $value = encrypt_user_encrypt_data($value);
+  }
+
+  return drupal_hash_base64($value);
 }
 
 /**
@@ -191,6 +294,10 @@ function encrypt_user_get_decrypted_user_field($account, $field_name) {
   // User is anonymous
   if ($account->uid == 0) {
     return NULL;
+  }
+
+  if (is_string($account->data)) {
+    $account->data = unserialize($account->data);
   }
 
   if (empty($account->data[$encrypted_field_name])) {
@@ -209,7 +316,7 @@ function encrypt_user_get_decrypted_user_field($account, $field_name) {
  * Helper to get the field name this module is responsible for.
  */
 function encrypt_user_get_field_names() {
-  // FIXME allow this to be a configuration (i.e. using a dedicated hook)
+  // TODO allow this to be a configuration (i.e. using a dedicated hook)
   return array(
     'name',
     'mail',
@@ -270,7 +377,7 @@ function encrypt_user_update_crypt_all($action) {
       }
       else { // Case $action == 'encrypt':
         $account->data[$encrypted_field_name] = encrypt_user_encrypt_data($account->{$field_name});
-        $account->{$field_name} = drupal_hash_base64($account->data[$encrypted_field_name]);
+        $account->{$field_name} = encrypt_user_get_hash($account->data[$encrypted_field_name], FALSE);
       }
 
       $update[$field_name] = $account->{$field_name};
@@ -300,3 +407,107 @@ function encrypt_user_update_crypt_all($action) {
     array('%crypted' => (($action == 'encrypt') ? t('encrypted') : t('decrypted')), '@updated_users' => $updated_users, '@total_users' => $n_users), WATCHDOG_NOTICE);
 }
 
+/**
+ * Implements hook_query_alter().
+ *
+ * @param QueryAlterableInterface $query
+ */
+function encrypt_user_query_alter(QueryAlterableInterface $query) {
+  $users_alias = FALSE;
+  $tables =& $query->getTables();
+  foreach ($tables as $table_alias => $table_properties) {
+    if ($table_properties['table'] == 'users') {
+      // The users table is queried.
+      $users_alias = $table_properties['alias'];
+      break;
+    }
+  }
+
+  if (!$users_alias) {
+    // {users} table is not in use, so there is nothing to do on this query
+    return;
+  }
+
+  // {users} table is queried, fix the query
+
+  $encrypted_fields = encrypt_user_get_field_names();
+
+
+  // manage where conditions : encrypt given value(s)
+  _encrypt_user_encrypt_where_clause($query, $users_alias, $encrypted_fields);
+
+  // TODO ? should we decrypt all fields in select clause ? Avoid duplicated encryption in i.e. user_load
+  // TODO ? should we take care of order by clause ?
+  // TODO ? should we take care of having clause ?
+}
+
+/**
+ * Recursively encrypt necessary fields in the whole where conditions list of a given query.
+ *
+ * @param $query
+ * @param $users_alias
+ * @param $encrypted_fields
+ */
+function _encrypt_user_encrypt_where_clause(&$query, $users_alias, $encrypted_fields) {
+  $where_conditions =& $query->conditions();
+
+  foreach ($where_conditions as &$where_condition) {
+    if (!is_array($where_condition)) {
+      continue;
+    }
+
+    if (!array_key_exists('field', $where_condition)) {
+      continue;
+    }
+
+    if (!array_key_exists('value', $where_condition)) {
+      continue;
+    }
+
+    // check if we can process the value or if we need to dig further
+    if (is_object($where_condition['field'])) {
+      // recursive call
+      _encrypt_user_encrypt_where_clause($where_condition['field'], $users_alias, $encrypted_fields);
+    }
+    else {
+      $field_name = str_replace($users_alias . '.', '', $where_condition['field']);
+
+      if (in_array($field_name, $encrypted_fields)) {
+        // get operator
+        $operator = drupal_strtoupper($where_condition['operator']);
+
+        if (in_array($operator, array('IS NULL'))) {
+          // this one do not need any value to compare to
+          continue;
+        }
+
+        if (in_array($operator, array('LIKE', 'NOT LIKE'))) {
+          $pattern_wildcards = '[^\\\\]%|^%';
+          if (preg_match("!$pattern_wildcards!", $where_condition['value']) === 1) {
+            // TODO manage LIKE with wildcards operators, search on wildcards will not work with a simple replacement !
+            // TODO manage _ wildcards
+            // in the meantime we ignore those, but it will broke all LIKE typed queries
+            continue;
+          }
+
+          // modify operator to use = instead of LIKE / <> instead of NOT LIKE
+          if ($operator == 'NOT LIKE') {
+            $where_condition['operator'] = '<>';
+          }
+          else {
+            $where_condition['operator'] = '=';
+          }
+        }
+
+        // hash the value to compare it to hashed DB value
+        if (!is_array($where_condition['value'])) {
+          $where_condition['value'] = encrypt_user_get_hash($where_condition['value'], TRUE);
+        }
+        else {
+          $where_condition['value'] = array_map('encrypt_user_get_hash', $where_condition['value']);
+        }
+
+      } // otherwise ignore field
+    }
+  }
+}

@@ -16,7 +16,8 @@ class views_handler_field_encrypt_user_user_name extends views_handler_field_use
    */
   function query() {
     // add this field to make it available in render
-    $this->query->add_field('users', 'data', 'users_data_encrypt');
+    $tableAlias = $this->getUserTableAlias($this->query->table_queue);
+    $this->query->add_field($tableAlias, 'data', 'users_data_encrypt');
     // In all cases, go through the parent default way
     return parent::query();
   }
@@ -33,5 +34,15 @@ class views_handler_field_encrypt_user_user_name extends views_handler_field_use
 
     // In all cases, go through the parent default way
     return parent::render($values);
+  }
+
+  private function getUserTableAlias($table_queue) {
+    foreach ($table_queue as $tableDef) {
+      if ($tableDef['table'] == 'users') {
+        return $tableDef['alias'];
+      }
+    }
+    //still here? we return a reasonable default
+    return 'users';
   }
 }
